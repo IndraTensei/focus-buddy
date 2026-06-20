@@ -8,6 +8,9 @@ Usage:
     python focus_buddy.py custom 40 10  # Custom: 40 min work, 10 min break
     python focus_buddy.py stats        # View today's focus statistics
     python focus_buddy.py history      # View focus history
+    python focus_buddy.py achievements # View unlocked achievements
+    python focus_buddy.py export       # Export stats to CSV
+    python focus_buddy.py report       # View weekly/monthly report
 """
 
 import sys
@@ -17,18 +20,116 @@ import time
 import math
 import signal
 import shutil
+import csv
+import io
 from datetime import datetime, timedelta
 from pathlib import Path
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DATA_DIR = Path.home() / ".focus-buddy"
 STATS_FILE = DATA_DIR / "stats.json"
+ACHIEVEMENTS_FILE = DATA_DIR / "achievements.json"
 DEFAULT_WORK = 25
 DEFAULT_BREAK = 5
 DEFAULT_LONG_BREAK = 15
 SESSIONS_BEFORE_LONG_BREAK = 4
+
+# ─── Achievement Definitions ─────────────────────────────────────────────────
+
+ACHIEVEMENTS = {
+    "first_session": {
+        "name": "🌱 First Step",
+        "description": "Complete your first Pomodoro session",
+        "icon": "🌱",
+        "condition": lambda s: count_completed_work_sessions(s) >= 1,
+    },
+    "ten_sessions": {
+        "name": "🔟 Getting Started",
+        "description": "Complete 10 Pomodoro sessions",
+        "icon": "🔟",
+        "condition": lambda s: count_completed_work_sessions(s) >= 10,
+    },
+    "fifty_sessions": {
+        "name": "🏅 Dedicated",
+        "description": "Complete 50 Pomodoro sessions",
+        "icon": "🏅",
+        "condition": lambda s: count_completed_work_sessions(s) >= 50,
+    },
+    "hundred_sessions": {
+        "name": "💯 Centurion",
+        "description": "Complete 100 Pomodoro sessions",
+        "icon": "💯",
+        "condition": lambda s: count_completed_work_sessions(s) >= 100,
+    },
+    "first_hour": {
+        "name": "⏰ Hour Hero",
+        "description": "Accumulate 60 minutes of focus time",
+        "icon": "⏰",
+        "condition": lambda s: total_focus_minutes(s) >= 60,
+    },
+    "five_hours": {
+        "name": "🕐 Focus Warrior",
+        "description": "Accumulate 300 minutes (5 hours) of focus time",
+        "icon": "🕐",
+        "condition": lambda s: total_focus_minutes(s) >= 300,
+    },
+    "ten_hours": {
+        "name": "🦾 Focus Machine",
+        "description": "Accumulate 600 minutes (10 hours) of focus time",
+        "icon": "🦾",
+        "condition": lambda s: total_focus_minutes(s) >= 600,
+    },
+    "streak_3": {
+        "name": "🔥 On Fire",
+        "description": "Maintain a 3-day focus streak",
+        "icon": "🔥",
+        "condition": lambda s: get_longest_streak(s) >= 3,
+    },
+    "streak_7": {
+        "name": "⚡ Week Warrior",
+        "description": "Maintain a 7-day focus streak",
+        "icon": "⚡",
+        "condition": lambda s: get_longest_streak(s) >= 7,
+    },
+    "streak_30": {
+        "name": "👑 Streak Legend",
+        "description": "Maintain a 30-day focus streak",
+        "icon": "👑",
+        "condition": lambda s: get_longest_streak(s) >= 30,
+    },
+    "early_bird": {
+        "name": "🐦 Early Bird",
+        "description": "Complete a session before 8 AM",
+        "icon": "🐦",
+        "condition": lambda s: has_session_before_hour(s, 8),
+    },
+    "night_owl": {
+        "name": "🦉 Night Owl",
+        "description": "Complete a session after 10 PM",
+        "icon": "🦉",
+        "condition": lambda s: has_session_after_hour(s, 22),
+    },
+    "marathon": {
+        "name": "🏃 Marathon Runner",
+        "description": "Complete 8 sessions in a single day",
+        "icon": "🏃",
+        "condition": lambda s: max_sessions_in_day(s) >= 8,
+    },
+    "centurion_minutes": {
+        "name": "🎯 Century Club",
+        "description": "Focus for 100 minutes in a single day",
+        "icon": "🎯",
+        "condition": lambda s: max_minutes_in_day(s) >= 100,
+    },
+    "consistent": {
+        "name": "📅 Consistent",
+        "description": "Complete sessions on 5 different days",
+        "icon": "📅",
+        "condition": lambda s: count_days_with_sessions(s) >= 5,
+    },
+}
 
 # ─── ASCII Art ───────────────────────────────────────────────────────────────
 
@@ -110,7 +211,6 @@ def ring_bell():
     """Try to play a terminal bell sound."""
     try:
         print('\a', end='', flush=True)
-        # Also try paplay or aplay if available
         os.system('paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null &')
     except Exception:
         pass
@@ -160,6 +260,347 @@ def get_all_daily_stats():
     stats = load_stats()
     return stats.get("daily", {})
 
+# ─── Achievement Helper Functions ────────────────────────────────────────────
+
+def count_completed_work_sessions(stats):
+    return sum(1 for s in stats.get("sessions", [])
+               if s.get("type") == "work" and s.get("completed"))
+
+def total_focus_minutes(stats):
+    return sum(d.get("focus_minutes", 0) for d in stats.get("daily", {}).values())
+
+def count_days_with_sessions(stats):
+    return len([d for d, v in stats.get("daily", {}).items() if v.get("sessions", 0) > 0])
+
+def max_sessions_in_day(stats):
+    return max((v.get("sessions", 0) for v in stats.get("daily", {}).values()), default=0)
+
+def max_minutes_in_day(stats):
+    return max((v.get("focus_minutes", 0) for v in stats.get("daily", {}).values()), default=0)
+
+def get_longest_streak(stats):
+    """Calculate the longest consecutive day streak with at least one completed work session."""
+    daily = stats.get("daily", {})
+    if not daily:
+        return 0
+
+    active_days = set()
+    for day, data in daily.items():
+        if data.get("sessions", 0) > 0:
+            active_days.add(day)
+
+    if not active_days:
+        return 0
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    max_streak = 0
+    for seed_day in [today, yesterday]:
+        if seed_day not in active_days:
+            continue
+        current = datetime.strptime(seed_day, "%Y-%m-%d")
+        streak = 0
+        while current.strftime("%Y-%m-%d") in active_days:
+            streak += 1
+            current -= timedelta(days=1)
+        max_streak = max(max_streak, streak)
+
+    sorted_days = sorted(active_days)
+    current_streak = 1
+    for i in range(1, len(sorted_days)):
+        prev = datetime.strptime(sorted_days[i - 1], "%Y-%m-%d")
+        curr = datetime.strptime(sorted_days[i], "%Y-%m-%d")
+        if (curr - prev).days == 1:
+            current_streak += 1
+        else:
+            max_streak = max(max_streak, current_streak)
+            current_streak = 1
+    max_streak = max(max_streak, current_streak)
+
+    return max_streak
+
+def has_session_before_hour(stats, hour):
+    for s in stats.get("sessions", []):
+        if s.get("completed") and s.get("type") == "work":
+            try:
+                ts = datetime.fromisoformat(s["timestamp"])
+                if ts.hour < hour:
+                    return True
+            except (ValueError, KeyError):
+                pass
+    return False
+
+def has_session_after_hour(stats, hour):
+    for s in stats.get("sessions", []):
+        if s.get("completed") and s.get("type") == "work":
+            try:
+                ts = datetime.fromisoformat(s["timestamp"])
+                if ts.hour >= hour:
+                    return True
+            except (ValueError, KeyError):
+                pass
+    return False
+
+# ─── Achievement System ──────────────────────────────────────────────────────
+
+def load_achievements():
+    if ACHIEVEMENTS_FILE.exists():
+        with open(ACHIEVEMENTS_FILE, 'r') as f:
+            return json.load(f)
+    return {"unlocked": {}, "first_seen": {}}
+
+def save_achievements(ach):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(ACHIEVEMENTS_FILE, 'w') as f:
+        json.dump(ach, f, indent=2)
+
+def check_achievements():
+    """Check all achievements and return newly unlocked ones."""
+    stats = load_stats()
+    ach = load_achievements()
+    newly_unlocked = []
+
+    for key, achievement in ACHIEVEMENTS.items():
+        if key not in ach["unlocked"]:
+            try:
+                if achievement["condition"](stats):
+                    ach["unlocked"][key] = {
+                        "unlocked_at": datetime.now().isoformat(),
+                        "name": achievement["name"],
+                        "description": achievement["description"],
+                    }
+                    newly_unlocked.append(achievement)
+            except Exception:
+                pass
+
+    save_achievements(ach)
+    return newly_unlocked, ach
+
+def show_achievements():
+    """Display all achievements (locked and unlocked)."""
+    _, ach = check_achievements()
+    clear_screen()
+    print()
+    print(center_text("╔══════════════════════════════════════════════════╗"))
+    print(center_text("║            🏆 ACHIEVEMENTS                       ║"))
+    print(center_text("╠══════════════════════════════════════════════════╣"))
+
+    unlocked_count = len(ach["unlocked"])
+    total_count = len(ACHIEVEMENTS)
+
+    for key, achievement in ACHIEVEMENTS.items():
+        if key in ach["unlocked"]:
+            unlocked_at = ach["unlocked"][key].get("unlocked_at", "")
+            try:
+                dt = datetime.fromisoformat(unlocked_at)
+                date_str = dt.strftime("%b %d")
+            except (ValueError, TypeError):
+                date_str = ""
+            status = f"✅ {achievement['name']}"
+            desc = f"   {achievement['description']} — {date_str}"
+        else:
+            status = "🔒 ???"
+            desc = "   (locked)"
+
+        print(center_text(f"║  {status:<47}║"))
+        print(center_text(f"║  {desc:<47}║"))
+        print(center_text("║                                                  ║"))
+
+    print(center_text("╠══════════════════════════════════════════════════╣"))
+    print(center_text(f"║  Unlocked: {unlocked_count}/{total_count}{' ' * (36 - len(str(unlocked_count)) - len(str(total_count)))}║"))
+    print(center_text("╚══════════════════════════════════════════════════╝"))
+    print()
+
+def show_new_achievements(newly_unlocked):
+    """Display newly unlocked achievements with fanfare."""
+    if not newly_unlocked:
+        return
+    print()
+    print(center_text("  🎉🎉🎉 NEW ACHIEVEMENT UNLOCKED! 🎉🎉🎉"))
+    print()
+    for ach in newly_unlocked:
+        print(center_text(f"  {ach['icon']} {ach['name']}"))
+        print(center_text(f"  {ach['description']}"))
+        print()
+    print(center_text("  Keep up the great work! 💪"))
+    print()
+
+# ─── CSV Export ──────────────────────────────────────────────────────────────
+
+def export_csv(output_path=None):
+    """Export all session data to CSV format."""
+    stats = load_stats()
+    sessions = stats.get("sessions", [])
+
+    if not sessions:
+        print("No sessions to export yet!")
+        return None
+
+    if output_path is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = DATA_DIR / f"focus_buddy_export_{timestamp}.csv"
+    else:
+        output_path = Path(output_path)
+
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Date", "Time", "Type", "Duration (min)", "Completed"])
+        for s in sessions:
+            try:
+                dt = datetime.fromisoformat(s["timestamp"])
+                date_str = dt.strftime("%Y-%m-%d")
+                time_str = dt.strftime("%H:%M:%S")
+            except (ValueError, KeyError):
+                date_str = s.get("date", "unknown")
+                time_str = "00:00:00"
+            writer.writerow([
+                date_str,
+                time_str,
+                s.get("type", ""),
+                s.get("duration", 0),
+                "Yes" if s.get("completed") else "No"
+            ])
+
+    return output_path
+
+def export_csv_string():
+    """Export all session data to a CSV string for display."""
+    stats = load_stats()
+    sessions = stats.get("sessions", [])
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Date", "Time", "Type", "Duration (min)", "Completed"])
+    for s in sessions:
+        try:
+            dt = datetime.fromisoformat(s["timestamp"])
+            date_str = dt.strftime("%Y-%m-%d")
+            time_str = dt.strftime("%H:%M:%S")
+        except (ValueError, KeyError):
+            date_str = s.get("date", "unknown")
+            time_str = "00:00:00"
+        writer.writerow([
+            date_str,
+            time_str,
+            s.get("type", ""),
+            s.get("duration", 0),
+            "Yes" if s.get("completed") else "No"
+        ])
+
+    return output.getvalue()
+
+# ─── Report Generation ───────────────────────────────────────────────────────
+
+def show_report(period="weekly"):
+    """Display a detailed weekly or monthly report."""
+    daily = get_all_daily_stats()
+    today = datetime.now()
+
+    if period == "weekly":
+        days_range = 7
+        title = "📈 WEEKLY FOCUS REPORT"
+        period_label = "This Week"
+    elif period == "monthly":
+        days_range = 30
+        title = "📈 MONTHLY FOCUS REPORT"
+        period_label = "This Month"
+    else:
+        days_range = 7
+        title = "📈 WEEKLY FOCUS REPORT"
+        period_label = "This Week"
+
+    period_days = []
+    total_sessions = 0
+    total_minutes = 0
+    total_breaks = 0
+    active_days = 0
+    best_day_sessions = 0
+    best_day_minutes = 0
+    best_day_label = "N/A"
+
+    for i in range(days_range - 1, -1, -1):
+        day = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+        day_label = (today - timedelta(days=i)).strftime("%a %b %d")
+
+        if day in daily:
+            d = daily[day]
+            sessions = d.get("sessions", 0)
+            minutes = d.get("focus_minutes", 0)
+            breaks = d.get("breaks", 0)
+            total_sessions += sessions
+            total_minutes += minutes
+            total_breaks += breaks
+            if sessions > 0:
+                active_days += 1
+            if sessions > best_day_sessions or (sessions == best_day_sessions and minutes > best_day_minutes):
+                best_day_sessions = sessions
+                best_day_minutes = minutes
+                best_day_label = day_label
+            period_days.append((day_label, sessions, minutes, True))
+        else:
+            period_days.append((day_label, 0, 0, False))
+
+    avg_sessions = total_sessions / days_range
+    avg_minutes = total_minutes / days_range
+    avg_minutes_active = total_minutes / active_days if active_days > 0 else 0
+
+    stats = load_stats()
+    current_streak = 0
+    check_day = today
+    while True:
+        day_str = check_day.strftime("%Y-%m-%d")
+        if day_str in daily and daily[day_str].get("sessions", 0) > 0:
+            current_streak += 1
+            check_day -= timedelta(days=1)
+        else:
+            break
+
+    longest_streak = get_longest_streak(stats)
+
+    clear_screen()
+    print()
+    print(center_text("╔═══════════════════════════════════════════════════╗"))
+    print(center_text(f"║  {title:<48}║"))
+    print(center_text("╠═══════════════════════════════════════════════════╣"))
+
+    hours = total_minutes // 60
+    mins = total_minutes % 60
+    print(center_text(f"║  Period: {period_label:<40}║"))
+    print(center_text("║                                                   ║"))
+    print(center_text(f"║  📊 Total Sessions:   {total_sessions:<25}║"))
+    print(center_text(f"║  ⏱  Total Focus Time: {hours}h {mins}m{' ' * (22 - len(str(hours)) - len(str(mins)))}║"))
+    print(center_text(f"║  ☕ Total Breaks:     {total_breaks:<25}║"))
+    print(center_text(f"║  📅 Active Days:      {active_days}/{days_range}{' ' * (23 - len(str(active_days)) - len(str(days_range)))}║"))
+    print(center_text("║                                                   ║"))
+    print(center_text("╠═══════════════════════════════════════════════════╣"))
+    print(center_text("║  📈 AVERAGES                                      ║"))
+    print(center_text(f"║  Sessions/day:  {avg_sessions:.1f}{' ' * (32 - len(f'{avg_sessions:.1f}'))}║"))
+    print(center_text(f"║  Minutes/day:   {avg_minutes:.1f}{' ' * (32 - len(f'{avg_minutes:.1f}'))}║"))
+    if active_days > 0:
+        print(center_text(f"║  Minutes/active: {avg_minutes_active:.1f}{' ' * (31 - len(f'{avg_minutes_active:.1f}'))}║"))
+    print(center_text("║                                                   ║"))
+    print(center_text("╠═══════════════════════════════════════════════════╣"))
+    print(center_text("║  🔥 STREAKS                                       ║"))
+    print(center_text(f"║  Current Streak:  {current_streak} day(s){' ' * (27 - len(str(current_streak)))}║"))
+    print(center_text(f"║  Longest Streak:  {longest_streak} day(s){' ' * (27 - len(str(longest_streak)))}║"))
+    print(center_text("║                                                   ║"))
+    print(center_text("╠═══════════════════════════════════════════════════╣"))
+    print(center_text("║  🏆 BEST DAY                                      ║"))
+    print(center_text(f"║  {best_day_label} — {best_day_sessions} sessions, {best_day_minutes} min{' ' * (20 - len(best_day_label) - len(str(best_day_sessions)) - len(str(best_day_minutes)))}║"))
+    print(center_text("║                                                   ║"))
+    print(center_text("╠═══════════════════════════════════════════════════╣"))
+    print(center_text("║  📅 DAILY BREAKDOWN                               ║"))
+
+    for day_label, sessions, minutes, active in period_days:
+        bar_len = min(sessions * 2, 16)
+        bar = "🟩" * bar_len + "⬜" * (16 - bar_len)
+        line = f"  {day_label} │ {bar} │ {sessions}s {minutes}m"
+        print(center_text(f"║  {line:<48}║"))
+
+    print(center_text("╚═══════════════════════════════════════════════════╝"))
+    print()
+
 # ─── Timer Engine ────────────────────────────────────────────────────────────
 
 class PomodoroTimer:
@@ -172,7 +613,6 @@ class PomodoroTimer:
         self.running = True
         self.interrupted = False
 
-        # Handle Ctrl+C gracefully
         signal.signal(signal.SIGINT, self._handle_interrupt)
 
     def _handle_interrupt(self, signum, frame):
@@ -193,7 +633,6 @@ class PomodoroTimer:
             bar = progress_bar(elapsed, total_seconds, width=40)
             time_str = format_time(remaining)
 
-            # Build display
             clear_screen()
             print()
             print(center_text(LOGO))
@@ -274,6 +713,10 @@ class PomodoroTimer:
         print(center_text(f"  Today's stats: {today['sessions']} sessions, "
                          f"{today['focus_minutes']} minutes focused"))
         print()
+
+        # Check for new achievements
+        newly_unlocked, _ = check_achievements()
+        show_new_achievements(newly_unlocked)
 
     def run_cycle(self):
         """Run a full Pomodoro cycle: work → break → work → break → ... → long break."""
@@ -412,10 +855,13 @@ def interactive_menu():
         print(center_text("  [2] ⚙️  Custom Timer"))
         print(center_text("  [3] 📊 View Today's Stats"))
         print(center_text("  [4] 📅 View 7-Day History"))
-        print(center_text("  [5] 🚪 Quit"))
+        print(center_text("  [5] 🏆 View Achievements"))
+        print(center_text("  [6] 📈 Weekly Report"))
+        print(center_text("  [7] 📤 Export to CSV"))
+        print(center_text("  [8] 🚪 Quit"))
         print()
 
-        choice = input(center_text("  Choose an option (1-5): ")).strip()
+        choice = input(center_text("  Choose an option (1-8): ")).strip()
 
         if choice == '1':
             timer = PomodoroTimer()
@@ -438,6 +884,35 @@ def interactive_menu():
             show_history()
             input(center_text("  Press Enter to continue..."))
         elif choice == '5':
+            show_achievements()
+            input(center_text("  Press Enter to continue..."))
+        elif choice == '6':
+            clear_screen()
+            print()
+            period = input(center_text("  [w] Weekly report | [m] Monthly report: ")).strip().lower()
+            if period == 'm':
+                show_report("monthly")
+            else:
+                show_report("weekly")
+            input(center_text("  Press Enter to continue..."))
+        elif choice == '7':
+            path = export_csv()
+            if path:
+                clear_screen()
+                print()
+                print(center_text("  📤 Export complete!"))
+                print()
+                print(center_text(f"  Saved to: {path}"))
+                print()
+                csv_content = export_csv_string()
+                lines = csv_content.strip().split('\n')
+                print(center_text("  Preview (first 10 rows):"))
+                print()
+                for line in lines[:11]:
+                    print(center_text(f"  {line}"))
+                print()
+            input(center_text("  Press Enter to continue..."))
+        elif choice == '8':
             clear_screen()
             print()
             print(center_text(BUDDY_FACE_DONE))
@@ -474,6 +949,24 @@ def main():
 
         elif cmd == "history":
             show_history()
+
+        elif cmd == "achievements":
+            show_achievements()
+
+        elif cmd == "export":
+            output_path = sys.argv[2] if len(sys.argv) > 2 else None
+            path = export_csv(output_path)
+            if path:
+                print(f"Exported to: {path}")
+            else:
+                print("No sessions to export.")
+
+        elif cmd == "report":
+            period = "weekly"
+            if len(sys.argv) > 2:
+                if sys.argv[2].lower() in ("monthly", "m"):
+                    period = "monthly"
+            show_report(period)
 
         elif cmd in ("help", "--help", "-h"):
             print(__doc__)
